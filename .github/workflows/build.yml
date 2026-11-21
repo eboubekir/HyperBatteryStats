@@ -1,1 +1,36 @@
+name: Build HyperBatteryStats v2 APK
+on: [push, workflow_dispatch]
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ZIP arsivini ac
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+          unzip -o "$ZIP_FILE" -d extracted
+          PROJECT_DIR=$(dirname "$(find extracted -name 'settings.gradle.kts' | head -n 1)")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: APK derle
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleRelease --no-daemon
+
+      - name: APK yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperBatteryStats-HyperOS4-v2-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+          retention-days: 30
+          
