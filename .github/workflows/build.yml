@@ -1,4 +1,4 @@
-name: Build HyperBatteryStats APK
+name: Build HyperBatteryStats v2 APK
 
 on:
   push:
@@ -9,39 +9,450 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Dosyaları al
-        uses: actions/checkout@v4
-
-      - name: ZIP arşivini aç ve proje klasörünü bul
+      - name: Proje dosyalarını oluştur (v2.0)
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
-          unzip -o "$ZIP_FILE" -d extracted
-          PROJECT_DIR=$(dirname "$(find extracted -name 'settings.gradle.kts' | head -n 1)")
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          mkdir -p app/src/main/assets
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/java/com/hyperos/batterystats
 
-      - name: Java 17 kur
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://api.xposed.info/") }
+              }
+          }
+          rootProject.name = "HyperBatteryStats"
+          include(":app")
+          EOF
 
-      - name: Gradle kur
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.10.2
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
 
-      - name: APK derle
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleRelease --no-daemon
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          kotlin.code.style=official
+          EOF
 
-      - name: APK dosyasını hazırla
-        run: |
-          APK_FILE=$(find "${{ env.PROJECT_DIR }}/app/build/outputs/apk/release" -name "*.apk" | head -n 1)
-          cp "$APK_FILE" HyperBatteryStats-HyperOS4.apk
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
 
-      - name: APK dosyasını yükle
-        uses: actions/upload-artifact@v4
-        with:
-          name: HyperBatteryStats-HyperOS4-APK
-          path: HyperBatteryStats-HyperOS4.apk
-          retention-days: 30
+          android {
+              namespace = "com.hyperos.batterystats"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.hyperos.batterystats"
+                  minSdk = 33
+                  targetSdk = 35
+                  versionCode = 2
+                  versionName = "2.0.0"
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig = signingConfigs.getByName("debug")
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              compileOnly("de.robv.android.xposed:api:82")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="HyperOS 4 Pil İstatistikleri">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="HyperOS 4 Pil ekranında canlı sıcaklık, döngü, gerçek kapasite ve ekran süresini (SoT) gösterir." />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/arrays.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>com.miui.securitycenter</item>
+                  <item>com.android.settings</item>
+              </string-array>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/assets/xposed_init
+          com.hyperos.batterystats.HyperOsBatteryHook
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/hyperos/batterystats/BatteryMetricsReader.kt
+          package com.hyperos.batterystats
+
+          import android.annotation.SuppressLint
+          import android.app.usage.UsageEvents
+          import android.app.usage.UsageStatsManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.os.BatteryManager
+          import android.os.IBinder
+          import java.io.File
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.roundToInt
+
+          data class BatterySnapshot(
+              val temperatureC: Float?,
+              val cycleCount: Int?,
+              val realCapacityMah: Int?,
+              val designCapacityMah: Int?,
+              val healthPercent: Int?,
+              val screenOnTimeMs: Long?,
+              val sotIs24hFallback: Boolean,
+              val powerWatts: Float?,
+              val isCharging: Boolean
+          )
+
+          object BatteryMetricsReader {
+
+              fun read(context: Context): BatterySnapshot {
+                  val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                  val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                      status == BatteryManager.BATTERY_STATUS_FULL
+
+                  val tempC = readTemperature(intent)
+                  val cycles = readCycleCount(intent)
+                  val (realMah, designMah) = readCapacities(context)
+
+                  val healthPct = if (realMah != null && designMah != null && designMah > 0) {
+                      ((realMah.toDouble() / designMah.toDouble()) * 100.0)
+                          .roundToInt()
+                          .coerceIn(1, 100)
+                  } else null
+
+                  val (sotMs, is24h) = readScreenOnTime(context)
+                  val watts = readPowerWatts(context, intent)
+
+                  return BatterySnapshot(
+                      temperatureC = tempC,
+                      cycleCount = cycles,
+                      realCapacityMah = realMah,
+                      designCapacityMah = designMah,
+                      healthPercent = healthPct,
+                      screenOnTimeMs = sotMs,
+                      sotIs24hFallback = is24h,
+                      powerWatts = watts,
+                      isCharging = isCharging
+                  )
+              }
+
+              private fun powerSupplyDirs(): List<File> {
+                  val preferred = listOf("bms", "battery", "maxfg", "qcom-battery", "mtk-gauge", "xm_bms")
+                  val root = File("/sys/class/power_supply")
+                  val all = root.listFiles()?.filter { it.isDirectory } ?: emptyList()
+                  val ordered = mutableListOf<File>()
+                  for (name in preferred) {
+                      all.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { ordered.add(it) }
+                  }
+                  for (dir in all) {
+                      if (ordered.none { it.absolutePath == dir.absolutePath }) ordered.add(dir)
+                  }
+                  val qcomDir = File("/sys/class/qcom-battery")
+                  if (qcomDir.isDirectory) ordered.add(qcomDir)
+                  return ordered
+              }
+
+              private fun readSysfsLong(fileName: String): Long? {
+                  for (dir in powerSupplyDirs()) {
+                      val v = readLongFile(File(dir, fileName))
+                      if (v != null) return v
+                  }
+                  return null
+              }
+
+              private fun readLongFile(file: File): Long? {
+                  return try {
+                      if (file.exists() && file.canRead()) {
+                          file.readText().trim().toLongOrNull()
+                      } else null
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              private fun normalizeMah(raw: Long?): Int? {
+                  if (raw == null || raw <= 0L) return null
+                  return if (raw > 100_000L) (raw / 1000L).toInt() else raw.toInt()
+              }
+
+              private fun readTemperature(intent: Intent?): Float? {
+                  val t = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+                  if (t != null && t != Int.MIN_VALUE && t > 0) return t / 10f
+                  val sys = readSysfsLong("temp") ?: return null
+                  return sys / 10f
+              }
+
+              private fun readCycleCount(intent: Intent?): Int? {
+                  val extra = intent?.getIntExtra("android.os.extra.CYCLE_COUNT", -1) ?: -1
+                  if (extra >= 0) return extra
+                  return readSysfsLong("cycle_count")?.takeIf { it >= 0L }?.toInt()
+              }
+
+              private fun readCapacities(context: Context): Pair<Int?, Int?> {
+                  for (dir in powerSupplyDirs()) {
+                      val full = normalizeMah(readLongFile(File(dir, "charge_full")))
+                      val design = normalizeMah(readLongFile(File(dir, "charge_full_design")))
+                      if (full != null && design != null) return Pair(full, design)
+                  }
+                  val full = normalizeMah(readSysfsLong("charge_full"))
+                  val design = normalizeMah(readSysfsLong("charge_full_design"))
+                      ?: readDesignFromPowerProfile(context)
+                  return Pair(full, design)
+              }
+
+              @SuppressLint("PrivateApi")
+              private fun readDesignFromPowerProfile(context: Context): Int? {
+                  return try {
+                      val c = Class.forName("com.android.internal.os.PowerProfile")
+                      val inst = c.getConstructor(Context::class.java).newInstance(context)
+                      val cap = c.getMethod("getBatteryCapacity").invoke(inst) as Double
+                      cap.roundToInt().takeIf { it > 0 }
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              private fun readPowerWatts(context: Context, intent: Intent?): Float? {
+                  return try {
+                      val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager ?: return null
+                      val rawCur = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+                      val voltMv = intent?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) ?: -1
+                      if (rawCur == Int.MIN_VALUE || rawCur == 0 || voltMv <= 0) return null
+                      val curMa = if (abs(rawCur) > 20_000) rawCur / 1000.0 else rawCur.toDouble()
+                      val watts = abs((voltMv / 1000.0) * (curMa / 1000.0))
+                      watts.toFloat()
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              private fun readScreenOnTime(context: Context): Pair<Long?, Boolean> {
+                  readSotFromBatteryStatsManager(context)?.let { return Pair(it, false) }
+                  readSotFromIBatteryStats()?.let { return Pair(it, false) }
+                  readSotFromUsageStats24h(context)?.let { return Pair(it, true) }
+                  return Pair(null, false)
+              }
+
+              @SuppressLint("PrivateApi")
+              private fun readSotFromBatteryStatsManager(context: Context): Long? {
+                  return try {
+                      val mgr = context.getSystemService("batterystats") ?: return null
+                      val usageStats = mgr.javaClass.getMethod("getBatteryUsageStats").invoke(mgr) ?: return null
+                      extractScreenDurationFromUsageStats(usageStats)
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              @SuppressLint("PrivateApi")
+              private fun readSotFromIBatteryStats(): Long? {
+                  return try {
+                      val sm = Class.forName("android.os.ServiceManager")
+                      val binder = sm.getMethod("getService", String::class.java).invoke(null, "batterystats") as? IBinder
+                          ?: return null
+                      val stub = Class.forName("com.android.internal.app.IBatteryStats\$Stub")
+                      val svc = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder) ?: return null
+
+                      val qBuilderClass = Class.forName("android.os.BatteryUsageStatsQuery\$Builder")
+                      val qBuilder = qBuilderClass.getDeclaredConstructor().newInstance()
+                      val query = qBuilderClass.getMethod("build").invoke(qBuilder)
+                      val m = svc.javaClass.methods.firstOrNull {
+                          it.name == "getBatteryUsageStats" && it.parameterCount == 1
+                      } ?: return null
+                      val list = m.invoke(svc, listOf(query)) as? List<*> ?: return null
+                      val usageStats = list.firstOrNull() ?: return null
+                      extractScreenDurationFromUsageStats(usageStats)
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              private fun extractScreenDurationFromUsageStats(usageStats: Any): Long? {
+                  return try {
+                      val getAgg = usageStats.javaClass.getMethod(
+                          "getAggregateBatteryConsumer",
+                          Int::class.javaPrimitiveType
+                      )
+                      val device = getAgg.invoke(usageStats, 0) ?: return null
+                      val getDur = device.javaClass.getMethod(
+                          "getUsageDurationMillis",
+                          Int::class.javaPrimitiveType
+                      )
+                      val ms = getDur.invoke(device, 0) as? Long
+                      ms?.takeIf { it > 0L }
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              private fun readSotFromUsageStats24h(context: Context): Long? {
+                  return try {
+                      val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                          ?: return null
+                      val now = System.currentTimeMillis()
+                      val start = now - 24L * 60L * 60L * 1000L
+                      val events = usm.queryEvents(start, now) ?: return null
+                      val event = UsageEvents.Event()
+                      var totalMs = 0L
+                      var screenOnAt = -1L
+                      while (events.hasNextEvent()) {
+                          events.getNextEvent(event)
+                          when (event.eventType) {
+                              UsageEvents.Event.SCREEN_INTERACTIVE -> {
+                                  if (screenOnAt < 0L) screenOnAt = event.timeStamp
+                              }
+                              UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
+                                  if (screenOnAt >= 0L) {
+                                      totalMs += (event.timeStamp - screenOnAt).coerceAtLeast(0L)
+                                      screenOnAt = -1L
+                                  }
+                              }
+                          }
+                      }
+                      if (screenOnAt >= 0L) {
+                          totalMs += (now - screenOnAt).coerceAtLeast(0L)
+                      }
+                      totalMs.takeIf { it >= 0L }
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              fun formatDuration(ms: Long?): String {
+                  if (ms == null || ms < 0L) return "Okunamadı"
+                  val mins = ms / 60_000L
+                  val h = mins / 60L
+                  val m = mins % 60L
+                  return if (h > 0L) "${h} sa ${m} dk" else "${m} dk"
+              }
+
+              fun formatTemp(temp: Float?): String =
+                  temp?.let { String.format(Locale.getDefault(), "%.1f °C", it) } ?: "N/A"
+
+              fun formatPower(watts: Float?, isCharging: Boolean): String {
+                  if (watts == null) return "N/A"
+                  val sign = if (isCharging) "+" else "-"
+                  return String.format(Locale.getDefault(), "%s%.1f W", sign, watts)
+              }
+
+              fun formatCapacity(real: Int?, design: Int?, health: Int?): String = when {
+                  real != null && design != null -> "$real / $design mAh (%${health ?: "--"})"
+                  real != null -> "$real mAh"
+                  else -> "N/A"
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/hyperos/batterystats/HyperOsBatteryHook.kt
+          package com.hyperos.batterystats
+
+          import android.app.Activity
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.TypedValue
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import de.robv.android.xposed.IXposedHookLoadPackage
+          import de.robv.android.xposed.XC_MethodHook
+          import de.robv.android.xposed.XposedBridge
+          import de.robv.android.xposed.XposedHelpers
+          import de.robv.android.xposed.callbacks.XC_LoadPackage
+          import java.util.WeakHashMap
+
+          class HyperOsBatteryHook : IXposedHookLoadPackage {
+
+              companion object {
+                  private const val TAG = "HyperBatteryStats"
+                  private const val CARD_TAG = "hyperos4_battery_overlay_card"
+                  private val TARGET_PACKAGES = setOf(
+                      "com.miui.securitycenter",
+                      "com.android.settings"
+                  )
+              }
+
+              private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+              private val refreshTasks = WeakHashMap<Activity, Runnable>()
+
+              override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+                  if (lpparam.packageName !in TARGET_PACKAGES) return
+
+                  XposedBridge.log("$TAG v2: ${lpparam.packageName} bağlandı.")
+
+                  XposedHelpers.findAndHookMethod(
+                      Activity::class.java,
+                      "onResume",
+                      object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              val activity = param.thisObject as? Activity ?: return
+                              if (!isBatteryActivity(activity)) return
+                              mainHandler.post { attachOrRefreshCard(activity) }
+                          }
+                      }
+                  )
+
+                  XposedHelpers.findAndHookMethod(
+                      Activity::class.java,
+                      "onPause",
+                      object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              val activity = param.thisObject as? Activity ?: return
+                              refreshTasks.remove(activity)?.let { mainHandler.removeCallbacks(it) }
+                          }
+                      }
+                  )
+              }
+
+              private fun isBatteryActivity(activity: Activity): Boolean {
+                  val name = activity.javaClass.name.lowercase()
+                  if (name.contains("dialog") || name.contains("popup") || name.contains("transparent")) {
+                      return false
+                  }
+                  return name.c
